@@ -1,0 +1,565 @@
+--@name SF Car nogon
+--@author Nogon
+--@shared
+--@include libs/unitconv.txt
+
+dofile("libs/unitconv.txt")
+    
+if SERVER then
+    local abs, clamp, max, min, sign, round, lerp = math.abs, math.clamp, math.max, math.min, math.sign, math.round, math.lerp
+    local Angle, Vector = Angle, Vector
+    
+    local CFG = {
+        E_Dir = Vector(0, 0, 1),
+        PowerRatio = 1, -- 1:RWD 0:AWD -1:FWD
+        GearRatios = {-3.20, 2.80, 2.00, 1.55, 1.22, 1.00, 0.85},
+        FinalDrive = 4.44,
+        EnginePower = 124000,
+        EngineIdleRPM = 750,
+        EngineLimitRPM = 9000,
+        EngineLaunchRPM = 4500,
+        EngineRotateFriction = 30, 
+        ThrustPower = 1704,
+        FrontGrip = 3,
+        RearGrip = 3.2,
+        BrakeForce = 23,
+        FrontDownForcePower = 0.2,
+        RearDownForcePower = 0.3,
+        ShiftDelay = 0.15,
+        EngineInertia = 0.15,
+        EngineAccel = 12000,
+        EngineBraking = 12000,
+        ClutchEngagement = 0.01,
+        -- 엔진 브레이킹 설정
+        EngineBrakingForce = 8,
+        EngineFrictionForce = 3,
+        CoastingDecel = 1.5,
+    }
+    
+     local CONST = {
+        PI_180 = 0.017453292519943,
+        TORQUE_MULT = 0.5625,
+        COUNTER_MULT = 0.000008,
+        IDLE_RPM_3X = CFG.EngineIdleRPM * 3,
+        LIMIT_95 = CFG.EngineLimitRPM * 0.95,
+        LIMIT_75 = CFG.EngineLimitRPM * 0.75,
+        LIMIT_55 = CFG.EngineLimitRPM * 0.55,
+        LIMIT_45 = CFG.EngineLimitRPM * 0.45,
+        LIMIT_MINUS_1000 = CFG.EngineLimitRPM - 1000,
+        ENGINE_HALF = CFG.EnginePower * 0.5,
+        ENGINE_TRIPLE = CFG.EnginePower * 3,
+    }
+    
+    local finalDriveDiv6 = CFG.FinalDrive 
+    for i = 1, #CFG.GearRatios do
+        CFG.GearRatios[i] = CFG.GearRatios[i] * finalDriveDiv6
+    end
+    
+    local wheelInertia = Vector(4.8, 4, 4.8)
+    local chassisInertia = Vector(800, 3600, 4000)
+    
+    -- 자동 변속 RPM 계산용 테이블
+    local AUTO_SHIFT = {
+        upshiftRPM = {},
+        downshiftRPM = {},
+        calculated = false
+    }
+    
+    -- 기어비 기반 최적 변속 RPM 계산 함수
+    local function calculateOptimalShiftRPMs()
+        if AUTO_SHIFT.calculated then return end
+        
+        local frontGears = {}
+        for i = 1, #CFG.GearRatios do
+            if CFG.GearRatios[i] > 0 then
+                frontGears[#frontGears + 1] = CFG.GearRatios[i]
+            end
+        end
+        
+        for i = 1, #frontGears do
+            if i < #frontGears then
+                local ratioChange = frontGears[i + 1] / frontGears[i]
+                local targetRPMAfterShift = CFG.EngineLimitRPM * 0.65
+                local upshiftRPM = targetRPMAfterShift / ratioChange
+                AUTO_SHIFT.upshiftRPM[i] = clamp(upshiftRPM, CFG.EngineLimitRPM * 0.85, CFG.EngineLimitRPM * 0.95)
+            else
+                AUTO_SHIFT.upshiftRPM[i] = CFG.EngineLimitRPM * 0.95
+            end
+            
+            if i > 1 then
+                local ratioChange = frontGears[i - 1] / frontGears[i]
+                local maxDownshiftRPM = CFG.EngineLimitRPM * 0.9 / ratioChange
+                local hysteresis = AUTO_SHIFT.upshiftRPM[i - 1] * 0.5
+                AUTO_SHIFT.downshiftRPM[i] = min(maxDownshiftRPM, hysteresis)
+                AUTO_SHIFT.downshiftRPM[i] = max(AUTO_SHIFT.downshiftRPM[i], CFG.EngineIdleRPM * 2)
+            else
+                AUTO_SHIFT.downshiftRPM[i] = CFG.EngineIdleRPM * 1.5
+            end
+        end
+        
+        AUTO_SHIFT.calculated = true
+    end
+    
+    hook.add("DupeFinished", "Dupefinished", function()
+        restart(chip())
+    end)
+
+    wire.adjustInputs({"ShiftUp", "ShiftDown", "Shift", "Alt", "Brake", "Throttle", "R", "Angle", "Pod", "Clutch", "Chassis", "FR", "FL", "RR", "RL"}, 
+                      {"n", "n", "n", "n", "n", "n", "n", "n", "e", "e", "e", "e", "e", "e", "e"})
+    wire.adjustOutputs({"EngineRpm", "Gear", "Boost", "Brake_out", "Flat", "Ratio", "Active", "Speed", "SmokeEff", "FireEff", "FireEff2", "Play", "Pitch", "Volume", "Counter", "Brake_Temp", "Automatic", "Shifting", "WheelRPM"},
+                       {"n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n", "n"})
+    
+    local INP = {
+        shiftup = 0, shiftdown = 0, brake = 0, w = 0, r = 0, angle = 0
+    }
+    
+    local ST = {
+        Active = false, flat = false, Automatic = true,
+        Gear = 0, Clutch = 0, ratio = 0, throttle = 0,
+        c = 0, W_SV = 0, Brake_Temp = 0, Power = 0, TargetRPM = 0, TP = 0, Thrust = 0,
+        smokeEff = 0, FireEff = 0, FireEff2 = 0,
+        Boost = -0.1, Pitch = 0, Volume = 0, Play = 0,
+        Brake_out = -500, BT = 0, lastShiftTime = 0,
+        prevRatio = 0  -- 이전 ratio 추적
+    }
+    
+    local SHIFT = {
+        isShifting = false,
+        shiftStartTime = 0,
+        targetGear = 0,
+        shiftCutPower = false,
+    }
+    
+    local ENT = {
+        pod = nil, clutch = nil, latch = nil, chassis = nil,
+        wheels = {}, latchWL = nil, clutchWL = nil
+    }
+    
+    local PHYS = {
+        W_Vel = {0, 0, 0, 0},
+        W_Dir = {},
+        W_Iner = {},
+        W_SI = 0,
+        chassisMass = 0,
+        numFrontGears = 0,
+        powerMul = 0,
+        FrontGear = {},
+        ReverseGear = {}
+    }
+    
+    local VENG = {
+        RPM = 0,
+        TargetRPM = 0,
+        WheelRPM = 0,
+        ClutchFactor = 0,
+        LastTime = 0,
+        TorqueOutput = 0,
+    }
+    
+    local CACHE = {
+        chassisForward = nil,
+        chassisUp = nil,
+        wheelRight = {},
+        updateTick = 0,
+        Change = {},
+        lastUpdate = 0,
+        tickCounter = 0
+    }
+    
+    -- Initialize
+    timer.simple(0.1, function()
+        ENT.pod = wire.ports.Pod
+        ENT.clutch = wire.ports.Clutch
+      
+        ENT.chassis = wire.ports.Chassis
+        ENT.wheels = {wire.ports.FR, wire.ports.FL, wire.ports.RR, wire.ports.RL}
+        
+        ENT.clutchWL = ENT.clutch:getWirelink()
+        
+        local unitConv = fromUnit("m", 1) ^ 2
+        
+        local chassisRight = ENT.chassis:getRight()
+        for i = 1, 4 do
+            ENT.wheels[i]:setInertia(wheelInertia)
+            ENT.wheels[i]:setFrozen(true)
+            PHYS.W_Dir[i] = sign(ENT.wheels[i]:getRight():dot(chassisRight))
+            PHYS.W_Iner[i] = wheelInertia.y * unitConv
+            PHYS.W_SI = PHYS.W_SI + PHYS.W_Iner[i]
+        end
+        
+        ENT.chassis:setInertia(chassisInertia)
+        
+        for i = 1, #CFG.GearRatios do
+            if CFG.GearRatios[i] < 0 then
+                PHYS.ReverseGear[#PHYS.ReverseGear + 1] = CFG.GearRatios[i]
+            else
+                PHYS.FrontGear[#PHYS.FrontGear + 1] = CFG.GearRatios[i]
+            end
+        end
+        
+        PHYS.numFrontGears = #PHYS.FrontGear
+        PHYS.powerMul = 1 / (1 + abs(CFG.PowerRatio))
+        PHYS.chassisMass = ENT.chassis:getMass()
+        
+        VENG.LastTime = timer.curtime()
+        
+        calculateOptimalShiftRPMs()
+    end)
+    
+    hook.add("input", "", function(n, v)
+        if n == "ShiftUp" then INP.shiftup = v
+        elseif n == "ShiftDown" then INP.shiftdown = v
+        elseif n == "Brake" then INP.brake = v
+        elseif n == "Throttle" then INP.w = v
+        elseif n == "Shift" and v == 1 then ST.flat = not ST.flat
+        elseif n == "Alt" and v == 1 then ST.Automatic = not ST.Automatic
+        elseif n == "R" and v == 1 then ST.Active = not ST.Active
+        elseif n == "Angle" then INP.angle = v end
+    end)
+    
+    local function Changed(n, v)
+        if v == CACHE.Change[n] then return false end
+        CACHE.Change[n] = v
+        return true
+    end
+    
+    local function startUpshift(targetGear, currentTime)
+        SHIFT.isShifting = true
+        SHIFT.shiftStartTime = currentTime
+        SHIFT.targetGear = targetGear
+        SHIFT.shiftCutPower = true
+    end
+    
+    local function completeShift()
+        ST.Gear = SHIFT.targetGear
+        SHIFT.isShifting = false
+        SHIFT.shiftCutPower = false
+        SHIFT.targetGear = 0
+    end
+    
+    hook.add("tick", "", function()
+        if not ENT.chassis then return end
+        
+        CACHE.tickCounter = CACHE.tickCounter + 1
+        local tick = CACHE.tickCounter
+        local currentTime = timer.curtime()
+        local dt = currentTime - VENG.LastTime
+        VENG.LastTime = currentTime
+        
+        dt = clamp(dt, 0.001, 0.1)
+        
+        local podVal = ENT.pod:getWirelink()
+        local active = podVal.Active
+        
+        if tick - CACHE.updateTick >= 5 then
+            CACHE.chassisForward = ENT.chassis:getForward()
+            CACHE.chassisUp = ENT.chassis:getUp()
+            for i = 1, 4 do
+                CACHE.wheelRight[i] = ENT.wheels[i]:getRight()
+            end
+            CACHE.updateTick = tick
+        end
+        
+        -- Velocity
+        local chassisLocalVel = ENT.chassis:getLocalVelocity()
+        local velX = chassisLocalVel.x
+        local speed = round(toUnit("km/h", abs(velX)), 1)
+        
+        -- Wheel velocities
+        ST.W_SV = 0
+        for i = 1, 4 do
+            PHYS.W_Vel[i] = ENT.wheels[i]:getAngleVelocity().y * CONST.PI_180
+            ST.W_SV = ST.W_SV + PHYS.W_Vel[i] * PHYS.W_Dir[i] * (1 + sign(i - 2.5) * CFG.PowerRatio) * 0.25
+        end
+        ST.throttle = INP.w
+        
+        -- Shift
+        if SHIFT.isShifting then
+            if currentTime - SHIFT.shiftStartTime >= CFG.ShiftDelay then
+                completeShift()
+            end
+        end
+        
+        -- Transmission
+        if not SHIFT.isShifting then
+            if ST.Automatic then
+                if Changed("shiftup", INP.shiftup) and INP.shiftup == 1 then
+                    if ST.Gear == -1 then
+                        ST.Gear = 0
+                    elseif ST.Gear == 0 then
+                        ST.Gear = 1
+                    elseif ST.Gear >= 1 and ST.Gear < PHYS.numFrontGears then
+                        startUpshift(ST.Gear + 1, currentTime)
+                    end
+                end
+                
+                if Changed("shiftdown", INP.shiftdown) and INP.shiftdown == 1 then
+                    if ST.Gear > 1 then
+                        ST.Gear = ST.Gear - 1
+                    elseif ST.Gear == 1 then
+                        ST.Gear = 0
+                    elseif ST.Gear == 0 then
+                        ST.Gear = -1
+                    end
+                end
+                
+                if ST.Gear >= 1 and AUTO_SHIFT.calculated then
+                    local upshiftMult = ST.flat and 1.05 or 1.0
+                    local downshiftMult = ST.flat and 0.8 or 1.0
+                    
+                    local upRPM = AUTO_SHIFT.upshiftRPM[ST.Gear] * upshiftMult
+                    local downRPM = AUTO_SHIFT.downshiftRPM[ST.Gear] * downshiftMult
+                    
+                    if ST.Gear < PHYS.numFrontGears and VENG.RPM > upRPM and ST.throttle > 0.1 then
+                        startUpshift(ST.Gear + 1, currentTime)
+                    elseif ST.Gear > 1 and VENG.RPM < downRPM and (ST.throttle < 0.3 or INP.brake > 0) then
+                        ST.Gear = ST.Gear - 1
+                    end
+                end
+            else
+                if Changed("shift", INP.shiftup + INP.shiftdown) then
+                    local newGear = clamp(ST.Gear + INP.shiftup - INP.shiftdown, -#PHYS.ReverseGear, PHYS.numFrontGears)
+                    if newGear > ST.Gear and ST.Gear >= 1 then
+                        startUpshift(newGear, currentTime)
+                    else
+                        ST.Gear = newGear
+                    end
+                end
+            end
+        end
+        
+        -- Ratio 계산 (먼저!)
+        if SHIFT.isShifting then
+            ST.ratio = 0
+        else
+            ST.ratio = ST.Gear < 0 and CFG.GearRatios[1] or (ST.Gear == 0 and 0 or CFG.GearRatios[ST.Gear + 1])
+        end
+        
+        -- 기어 진입 감지 (ratio 기반)
+        local gearJustEngaged = (ST.prevRatio == 0 and ST.ratio ~= 0)
+        ST.prevRatio = ST.ratio
+        
+        -- Clutch (즉시 체결)
+        if SHIFT.isShifting then
+            ST.Clutch = 0
+        else
+            local isLaunch = ST.Gear == 1 and INP.brake > 0 and ST.throttle > 0
+            ST.Clutch = (ST.Gear == 0 or isLaunch) and 0 or 1
+        end
+        
+        -- Engine 설정
+        ST.Power = ST.flat and CFG.EnginePower or CFG.EnginePower/2
+        ST.TargetRPM = (ST.Gear == 1 and ST.throttle > 0 and INP.brake > 0) and CFG.EngineLaunchRPM or CFG.EngineLimitRPM
+        
+        -- 휠 RPM 계산 (엔진 업데이트 전에)
+        VENG.WheelRPM = abs(ST.W_SV * ST.ratio * 60 / (2 * math.pi))
+        
+        -- 기어 진입 시 RPM 즉시 동기화
+        if gearJustEngaged then
+            VENG.RPM = max(VENG.WheelRPM, CFG.EngineIdleRPM)
+        end
+        
+        -- 클러치 즉시 체결
+        VENG.ClutchFactor = (ST.ratio ~= 0) and ST.Clutch or 0
+        
+        -- 엔진 업데이트
+        local EngineRPM
+        if not ST.Active then
+            VENG.RPM = lerp(dt * 5, VENG.RPM, 0)
+            VENG.ClutchFactor = 0
+            EngineRPM = 0
+        else
+            -- 목표 RPM 결정
+            if SHIFT.shiftCutPower then
+                VENG.TargetRPM = max(VENG.RPM - CFG.EngineBraking * dt * 2, CFG.EngineIdleRPM)
+            elseif ST.ratio ~= 0 and ST.Clutch > 0 then
+                -- 클러치 체결 상태: 휠 RPM 기반
+                local baseRPM = max(VENG.WheelRPM, CFG.EngineIdleRPM)
+                if ST.throttle > 0 then
+                    local throttleBoost = (ST.TargetRPM - baseRPM) * ST.throttle * 0.3
+                    VENG.TargetRPM = baseRPM + throttleBoost
+                else
+                    VENG.TargetRPM = baseRPM
+                end
+            elseif ST.throttle > 0 then
+                -- 뉴트럴에서 공회전
+                VENG.TargetRPM = CFG.EngineIdleRPM + (ST.TargetRPM - CFG.EngineIdleRPM) * ST.throttle
+            else
+                VENG.TargetRPM = CFG.EngineIdleRPM
+            end
+            
+            VENG.TargetRPM = min(VENG.TargetRPM, CFG.EngineLimitRPM)
+            
+            local rpmDiff = VENG.TargetRPM - VENG.RPM
+            local accelRate = rpmDiff > 0 and CFG.EngineAccel or CFG.EngineBraking
+            
+            if ST.throttle > 0 and rpmDiff > 0 then
+                accelRate = accelRate * (0.5 + ST.throttle * 0.5)
+            end
+            
+            if ST.throttle == 0 and rpmDiff < 0 then
+                accelRate = accelRate * 2.5
+            end
+            
+            local maxChange = accelRate * dt
+            VENG.RPM = VENG.RPM + clamp(rpmDiff, -maxChange, maxChange)
+            VENG.RPM = clamp(VENG.RPM, 0, CFG.EngineLimitRPM)
+            
+            EngineRPM = round(VENG.RPM)
+        end
+        
+        -- 토크 출력
+        local torqueMultiplier = 1
+        if VENG.RPM > CFG.EngineLimitRPM * 0.95 then
+            torqueMultiplier = 0.3
+        elseif VENG.RPM < CFG.EngineIdleRPM then
+            torqueMultiplier = 0.5
+        end
+        VENG.TorqueOutput = ST.throttle * torqueMultiplier * VENG.ClutchFactor
+        
+        -- Torque to wheels
+        local Counter = 0
+        if ST.ratio ~= 0 and VENG.TorqueOutput > 0 and not SHIFT.shiftCutPower then
+            local baseTorque = ST.Power * VENG.TorqueOutput * 0.0001
+            
+            for i = 1, 4 do
+                local powerSign = 1 + sign(i - 2.5) * CFG.PowerRatio
+                local Torque = baseTorque * PHYS.W_Dir[i] * powerSign * PHYS.powerMul * PHYS.W_Iner[i] * ST.ratio
+                Counter = Counter + Torque * PHYS.W_Dir[i]
+                ENT.wheels[i]:applyAngForce(Angle(Torque/30, 0, 0))
+            end
+        end
+        
+        ST.c = ST.c * 0.65 + Counter * CONST.COUNTER_MULT
+        Counter = round(Counter)
+
+        -- 엔진 브레이킹 시스템
+        local engineBrakeForce = 0
+        
+        if ST.Active and ST.Gear >= 1 and not SHIFT.isShifting and speed > 5 then
+            local isCoasting = ST.throttle < 0.1 and INP.brake == 0
+            local isEngineBraking = ST.throttle < 0.1
+            
+            if isEngineBraking then
+                local gearMultiplier = abs(ST.ratio) / abs(CFG.GearRatios[#CFG.GearRatios])
+                local rpmFactor = clamp((VENG.RPM - CFG.EngineIdleRPM) / (CFG.EngineLimitRPM - CFG.EngineIdleRPM), 0, 1)
+                local speedFactor = clamp(speed / 50, 0.2, 1)
+                
+                local frictionForce = CFG.EngineFrictionForce * gearMultiplier * speedFactor
+                local brakingForce = CFG.EngineBrakingForce * gearMultiplier * rpmFactor * speedFactor
+                local coastingForce = isCoasting and CFG.CoastingDecel or 0
+                
+                engineBrakeForce = frictionForce + brakingForce + coastingForce
+                engineBrakeForce = engineBrakeForce * ST.Clutch
+            end
+        end
+        
+        if engineBrakeForce > 0 and CACHE.chassisForward then
+            local brakeDir = velX > 0 and -1 or 1
+            ENT.chassis:applyForceCenter(CACHE.chassisForward * PHYS.chassisMass * engineBrakeForce * brakeDir)
+            
+            local wheelBrakeTorque = engineBrakeForce * 0.5
+            for i = 3, 4 do
+                local torqueDir = PHYS.W_Vel[i] > 0 and -1 or 1
+                ENT.wheels[i]:applyAngForce(Angle(wheelBrakeTorque * torqueDir * PHYS.W_Dir[i], 0, 0))
+            end
+        end
+
+        -- Effects
+        if tick % 4 == 0 then
+            local effectDt = currentTime - CACHE.lastUpdate
+            local boostInc = EngineRPM >= 1200 and ST.throttle > 0
+            ST.Boost = clamp(ST.Boost + (boostInc and 20 or -0.1) * effectDt, -0.1, 20)
+            ST.Volume = boostInc and 0.25 or 0
+            ST.smokeEff = (active == 1 and EngineRPM < CONST.IDLE_RPM_3X and ST.throttle == 0) and 1 or 0
+            ST.FireEff = (EngineRPM > 5000 and ST.throttle == 0) and 1 or 0
+            ST.FireEff2 = (EngineRPM > 6000 and ST.Boost >= 15 and INP.shiftup == 1) and 1 or 0
+            ST.Play = ((ST.Boost >= 15 and ST.throttle == 0) or (ST.Boost >= 15 and EngineRPM > 7000 and Changed("GearPlay", ST.Gear))) and 1 or 0
+            ST.Pitch = ST.Boost * 0.1
+            CACHE.lastUpdate = currentTime
+        end
+        
+        -- Temperature
+        if tick % 3 == 0 then
+            local tempChange = (speed > 30 and INP.brake == 1) and 0.014 or (speed > 60 and -0.0075 or -0.0005)
+            ST.Brake_Temp = clamp(ST.Brake_Temp + tempChange, 0, 100)
+        end
+        
+        if ENT.latchWL then ENT.latchWL.Activate = ST.Active and 0 or 1 end
+        ST.Gear = active == 0 and 0 or ST.Gear
+        
+        -- Thrust
+        local gearTorqueMult = ST.ratio ~= 0 and abs(ST.ratio) / abs(CFG.GearRatios[2]) or 0
+        ST.TP = EngineRPM / CFG.ThrustPower * gearTorqueMult
+        local canThrust = ST.Gear >= 1 and ST.throttle > 0 and EngineRPM < CFG.EngineLimitRPM and ST.Active and INP.brake == 0 and not SHIFT.isShifting
+        ST.Thrust = canThrust and ST.TP or 0
+        
+        if ST.Thrust > 0 then
+            ENT.chassis:applyForceCenter(CACHE.chassisForward * PHYS.chassisMass * ST.Thrust * ST.throttle)
+        end
+        
+        -- Grip
+        if tick % 2 == 0 and ST.Active and speed < 240 then
+            local w1v = ENT.wheels[1]:getLocalVelocity().y
+            local w2v = ENT.wheels[2]:getLocalVelocity().y
+            local w3v = ENT.wheels[3]:getLocalVelocity().y
+            local w4v = ENT.wheels[4]:getLocalVelocity().y
+            
+            ENT.wheels[1]:applyForceCenter(CACHE.wheelRight[1] * w1v * CFG.FrontGrip)
+            ENT.wheels[2]:applyForceCenter(CACHE.wheelRight[2] * w2v * CFG.FrontGrip)
+            ENT.wheels[3]:applyForceCenter(CACHE.wheelRight[3] * w3v * CFG.RearGrip)
+            ENT.wheels[4]:applyForceCenter(CACHE.wheelRight[4] * w4v * CFG.RearGrip)
+        end
+
+        -- Braking
+        local brakeTarget = min(INP.brake + (active == 0 and 1 or 0), 1) * 150
+        ST.Brake_out = clamp(ST.Brake_out + (brakeTarget - ST.Brake_out) * 0.01, -500, 150)
+        
+        if ENT.clutchWL then
+            local brakeSpeed = (ST.Gear == 0 or ST.Gear >= 1) and 15 or 200
+            ENT.clutchWL.Friction = ((speed <= brakeSpeed and INP.brake > 0) or active == 0) and ST.Brake_out or 0
+        end
+        
+        local FrontSpeed = toUnit("km/h", max(velX, 0))
+        ST.BT = (ST.Gear >= 0 and FrontSpeed >= 15 and INP.brake > 0) and 1 or 0
+        
+        if ST.BT > 0 then
+            ENT.chassis:applyForceCenter(-CACHE.chassisForward * PHYS.chassisMass * CFG.BrakeForce)
+        end
+        
+        -- Downforce
+        if tick % 3 == 0 and ST.Active and speed > 50 then
+            local speedFactor = speed * 0.001 * PHYS.chassisMass
+            local frontForce = -CACHE.chassisUp * speedFactor * CFG.FrontDownForcePower
+            local rearForce = -CACHE.chassisUp * speedFactor * CFG.RearDownForcePower
+            
+            ENT.wheels[1]:applyForceCenter(frontForce)
+            ENT.wheels[2]:applyForceCenter(frontForce)
+            ENT.wheels[3]:applyForceCenter(rearForce)
+            ENT.wheels[4]:applyForceCenter(rearForce)
+        end
+        
+        -- Outputs
+        wire.ports.EngineRpm = EngineRPM
+        wire.ports.Gear = ST.Gear
+        wire.ports.Boost = ST.Boost
+        wire.ports.Brake_out = ST.Brake_out
+        wire.ports.Flat = ST.flat and 1 or 0
+        wire.ports.Ratio = ST.ratio
+        wire.ports.Active = ST.Active and 1 or 0
+        wire.ports.Speed = speed
+        wire.ports.SmokeEff = ST.smokeEff
+        wire.ports.FireEff = ST.FireEff
+        wire.ports.FireEff2 = ST.FireEff2
+        wire.ports.Play = ST.Play
+        wire.ports.Pitch = ST.Pitch
+        wire.ports.Volume = ST.Volume
+        wire.ports.Counter = Counter
+        wire.ports.Brake_Temp = ST.Brake_Temp
+        wire.ports.Automatic = ST.Automatic and 1 or 0
+        wire.ports.Shifting = SHIFT.isShifting and 1 or 0
+        wire.ports.WheelRPM = round(VENG.WheelRPM)
+    end)
+
+elseif CLIENT then
+end
